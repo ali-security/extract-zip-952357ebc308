@@ -144,6 +144,11 @@ class Extractor {
       debug('creating symlink', link, dest)
       await fs.symlink(link, dest)
     } else {
+      const existing = await fs.lstat(dest).catch(() => null)
+      if (existing && existing.isSymbolicLink()) {
+        throw new Error(`Out of bound path "${dest}" found while processing file ${entry.fileName}`)
+      }
+
       await pipeline(readStream, createWriteStream(dest, { mode: procMode }))
     }
   }

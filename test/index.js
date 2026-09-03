@@ -59,71 +59,104 @@ function crc32 (buf) {
   return (crc ^ -1) >>> 0
 }
 
-// Builds a minimal store-only (compression method 0) zip holding a single entry that
-// is flagged as a unix symlink, with the symlink target as the entry contents. This
-// is how a malicious archive smuggles an out of bound symlink past an extractor.
-function symlinkZipBuffer (fileName, target) {
-  const nameBuf = Buffer.from(fileName, 'utf8')
-  const dataBuf = Buffer.from(target, 'utf8')
-  const crc = crc32(dataBuf)
+// Unix stat modes stored in the external file attributes of a zip entry, telling
+// the extractor whether the entry is a symlink (contents = link target) or a plain
+// file (contents = file data).
+const symlinkMode = 0o120777
+const regularFileMode = 0o100644
+
+// Builds a minimal store-only (compression method 0) zip out of a list of
+// { fileName, contents, mode } entries. Flagging an entry as a unix symlink and
+// putting the link target in its contents is how a malicious archive smuggles an
+// out of bound symlink past an extractor.
+function zipBuffer (entries) {
   const modTime = 24576 // 12:00:00
   const modDate = 20682 // 2020-06-10
   const unixMadeBy = 3 << 8
-  const symlinkAttributes = 0o120777 * 0x10000 // shifting would overflow into a signed int
+  const localRecords = []
+  const centralRecords = []
+  let localOffset = 0
 
-  const localHeader = Buffer.alloc(30)
-  localHeader.writeUInt32LE(0x04034b50, 0) // local file header signature
-  localHeader.writeUInt16LE(20, 4) // version needed to extract
-  localHeader.writeUInt16LE(0, 6) // general purpose bit flag
-  localHeader.writeUInt16LE(0, 8) // compression method: stored
-  localHeader.writeUInt16LE(modTime, 10)
-  localHeader.writeUInt16LE(modDate, 12)
-  localHeader.writeUInt32LE(crc, 14)
-  localHeader.writeUInt32LE(dataBuf.length, 18) // compressed size
-  localHeader.writeUInt32LE(dataBuf.length, 22) // uncompressed size
-  localHeader.writeUInt16LE(nameBuf.length, 26)
-  localHeader.writeUInt16LE(0, 28) // extra field length
+  for (const entry of entries) {
+    const nameBuf = Buffer.from(entry.fileName, 'utf8')
+    const dataBuf = Buffer.from(entry.contents, 'utf8')
+    const crc = crc32(dataBuf)
+    const externalAttributes = entry.mode * 0x10000 // shifting would overflow into a signed int
 
-  const centralHeader = Buffer.alloc(46)
-  centralHeader.writeUInt32LE(0x02014b50, 0) // central directory header signature
-  centralHeader.writeUInt16LE(unixMadeBy, 4) // version made by
-  centralHeader.writeUInt16LE(20, 6) // version needed to extract
-  centralHeader.writeUInt16LE(0, 8) // general purpose bit flag
-  centralHeader.writeUInt16LE(0, 10) // compression method: stored
-  centralHeader.writeUInt16LE(modTime, 12)
-  centralHeader.writeUInt16LE(modDate, 14)
-  centralHeader.writeUInt32LE(crc, 16)
-  centralHeader.writeUInt32LE(dataBuf.length, 20) // compressed size
-  centralHeader.writeUInt32LE(dataBuf.length, 24) // uncompressed size
-  centralHeader.writeUInt16LE(nameBuf.length, 28)
-  centralHeader.writeUInt16LE(0, 30) // extra field length
-  centralHeader.writeUInt16LE(0, 32) // file comment length
-  centralHeader.writeUInt16LE(0, 34) // disk number start
-  centralHeader.writeUInt16LE(0, 36) // internal file attributes
-  centralHeader.writeUInt32LE(symlinkAttributes, 38) // external file attributes
-  centralHeader.writeUInt32LE(0, 42) // relative offset of local header
+    const localHeader = Buffer.alloc(30)
+    localHeader.writeUInt32LE(0x04034b50, 0) // local file header signature
+    localHeader.writeUInt16LE(20, 4) // version needed to extract
+    localHeader.writeUInt16LE(0, 6) // general purpose bit flag
+    localHeader.writeUInt16LE(0, 8) // compression method: stored
+    localHeader.writeUInt16LE(modTime, 10)
+    localHeader.writeUInt16LE(modDate, 12)
+    localHeader.writeUInt32LE(crc, 14)
+    localHeader.writeUInt32LE(dataBuf.length, 18) // compressed size
+    localHeader.writeUInt32LE(dataBuf.length, 22) // uncompressed size
+    localHeader.writeUInt16LE(nameBuf.length, 26)
+    localHeader.writeUInt16LE(0, 28) // extra field length
 
-  const localRecord = Buffer.concat([localHeader, nameBuf, dataBuf])
-  const centralRecord = Buffer.concat([centralHeader, nameBuf])
+    const centralHeader = Buffer.alloc(46)
+    centralHeader.writeUInt32LE(0x02014b50, 0) // central directory header signature
+    centralHeader.writeUInt16LE(unixMadeBy, 4) // version made by
+    centralHeader.writeUInt16LE(20, 6) // version needed to extract
+    centralHeader.writeUInt16LE(0, 8) // general purpose bit flag
+    centralHeader.writeUInt16LE(0, 10) // compression method: stored
+    centralHeader.writeUInt16LE(modTime, 12)
+    centralHeader.writeUInt16LE(modDate, 14)
+    centralHeader.writeUInt32LE(crc, 16)
+    centralHeader.writeUInt32LE(dataBuf.length, 20) // compressed size
+    centralHeader.writeUInt32LE(dataBuf.length, 24) // uncompressed size
+    centralHeader.writeUInt16LE(nameBuf.length, 28)
+    centralHeader.writeUInt16LE(0, 30) // extra field length
+    centralHeader.writeUInt16LE(0, 32) // file comment length
+    centralHeader.writeUInt16LE(0, 34) // disk number start
+    centralHeader.writeUInt16LE(0, 36) // internal file attributes
+    centralHeader.writeUInt32LE(externalAttributes, 38) // external file attributes
+    centralHeader.writeUInt32LE(localOffset, 42) // relative offset of local header
+
+    const localRecord = Buffer.concat([localHeader, nameBuf, dataBuf])
+    localOffset += localRecord.length
+    localRecords.push(localRecord)
+    centralRecords.push(Buffer.concat([centralHeader, nameBuf]))
+  }
+
+  const localDirectory = Buffer.concat(localRecords)
+  const centralDirectory = Buffer.concat(centralRecords)
 
   const endRecord = Buffer.alloc(22)
   endRecord.writeUInt32LE(0x06054b50, 0) // end of central directory signature
   endRecord.writeUInt16LE(0, 4) // number of this disk
   endRecord.writeUInt16LE(0, 6) // disk where central directory starts
-  endRecord.writeUInt16LE(1, 8) // central directory records on this disk
-  endRecord.writeUInt16LE(1, 10) // total central directory records
-  endRecord.writeUInt32LE(centralRecord.length, 12) // size of central directory
-  endRecord.writeUInt32LE(localRecord.length, 16) // offset of central directory
+  endRecord.writeUInt16LE(entries.length, 8) // central directory records on this disk
+  endRecord.writeUInt16LE(entries.length, 10) // total central directory records
+  endRecord.writeUInt32LE(centralDirectory.length, 12) // size of central directory
+  endRecord.writeUInt32LE(localDirectory.length, 16) // offset of central directory
   endRecord.writeUInt16LE(0, 20) // comment length
 
-  return Buffer.concat([localRecord, centralRecord, endRecord])
+  return Buffer.concat([localDirectory, centralDirectory, endRecord])
+}
+
+async function writeZip (t, suffix, entries) {
+  const zipDir = await mkdtemp(t, `${suffix}-zip`)
+  const zipPath = path.join(zipDir, 'malicious.zip')
+  await fs.writeFile(zipPath, zipBuffer(entries))
+  return zipPath
 }
 
 async function writeSymlinkZip (t, suffix, target) {
-  const zipDir = await mkdtemp(t, `${suffix}-zip`)
-  const zipPath = path.join(zipDir, 'malicious.zip')
-  await fs.writeFile(zipPath, symlinkZipBuffer(evilSymlinkName, target))
-  return zipPath
+  return writeZip(t, suffix, [{ fileName: evilSymlinkName, contents: target, mode: symlinkMode }])
+}
+
+// The destination directory of a leaf test, next to a canary file that sits outside
+// of it and must never be written through a symlink.
+async function leafFixture (t, suffix) {
+  const parent = await mkdtemp(t, suffix)
+  const dirPath = path.join(parent, 'dest')
+  await fs.mkdir(dirPath)
+  const canary = path.join(parent, 'canary.txt')
+  await fs.writeFile(canary, 'ORIGINAL')
+  return { dirPath, canary }
 }
 
 async function assertPermissions (t, pathToCheck, expectedMode) {
@@ -192,6 +225,26 @@ test('symlink with an in bound target is stored verbatim', async t => {
   const stats = await fs.lstat(symlink)
   t.truthy(stats.isSymbolicLink(), 'symlink is valid')
   t.is(await fs.readlink(symlink), 'sibling', 'link target is not rewritten')
+})
+
+// The archive shape used by the arbitrary write PoC: an out of bound symlink
+// immediately followed by a regular file carrying the very same name, so that the
+// file is written through the symlink the archive itself just planted. Only the
+// parent directory of an entry used to be checked, never the leaf. Runs on every
+// platform: the offending entry is refused before fs.symlink() is ever reached.
+test('archive planting a symlink and writing a file through it disallowed', async t => {
+  const { dirPath, canary } = await leafFixture(t, 'symlink-leaf-archive')
+  const zipPath = await writeZip(t, 'symlink-leaf-archive', [
+    { fileName: 'pwn', contents: path.join('..', 'canary.txt'), mode: symlinkMode },
+    { fileName: 'pwn', contents: 'PWNED', mode: regularFileMode }
+  ])
+
+  await t.throwsAsync(extract(zipPath, { dir: dirPath }), {
+    message: /Out of bound path ".*?" found while processing file pwn/
+  })
+
+  t.is(await fs.readFile(canary, 'utf8'), 'ORIGINAL', 'file outside the target directory is untouched')
+  await nothingExistsAt(t, path.join(dirPath, 'pwn'), 'symlink not created')
 })
 
 test('directories', async t => {
@@ -279,6 +332,26 @@ if (process.platform !== 'win32') {
     })
 
     await pathDoesntExist(t, path.join(outsideDir, 'aaa'), 'nothing extracted outside the target directory')
+  })
+
+  // The leaf of the destination path is checked too, not just its parent directory:
+  // a symlink already sitting where a regular file entry is about to be written must
+  // never be written through. The reference archive plants that symlink with a first
+  // entry of its own, which the symlink target check above already refuses before it
+  // is created, so this plants it by hand to reach the leaf check.
+  test('symlink at the leaf is not written through', async t => {
+    const { dirPath, canary } = await leafFixture(t, 'symlink-leaf')
+    await fs.symlink(canary, path.join(dirPath, 'pwn'))
+    const zipPath = await writeZip(t, 'symlink-leaf', [
+      { fileName: 'pwn', contents: 'PWNED', mode: regularFileMode }
+    ])
+
+    await t.throwsAsync(extract(zipPath, { dir: dirPath }), {
+      message: /Out of bound path ".*?" found while processing file pwn/
+    })
+
+    t.is(await fs.readFile(canary, 'utf8'), 'ORIGINAL', 'file outside the target directory is untouched')
+    t.true((await fs.lstat(path.join(dirPath, 'pwn'))).isSymbolicLink(), 'planted symlink refused, not followed')
   })
 
   test('defaultDirMode', async t => {
